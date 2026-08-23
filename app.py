@@ -3,11 +3,17 @@ from __future__ import annotations
 import io
 import json
 import html
+import hmac
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
 
 
 st.set_page_config(page_title="Live Auction Draft Analyzer", page_icon="🏈", layout="wide")
@@ -41,7 +47,9 @@ DEFAULT_MANAGERS = [
 
 st.markdown("""
 <style>
-    .stApp { background: linear-gradient(180deg, #f8fbff 0%, #ffffff 42%); }
+    :root { color-scheme: light !important; }
+    .stApp { background: linear-gradient(180deg, #f8fbff 0%, #ffffff 42%); color:#0f172a; }
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] { color:#0f172a; }
     [data-testid="stMetric"] {
         background: linear-gradient(135deg, #ffffff, #eef5ff);
         border: 1px solid #dbeafe; border-radius: 14px; padding: 12px;
@@ -61,6 +69,12 @@ st.markdown("""
     .roster-counts { display:grid; grid-template-columns:repeat(4,1fr); gap:5px; margin:8px 0 10px 0; }
     .roster-count { text-align:center; border-radius:8px; padding:5px 2px; font-size:.73rem;
         font-weight:900; border:1px solid; }
+    @media (max-width: 640px) {
+        .block-container { padding-top: 1.2rem; padding-left: .75rem; padding-right: .75rem; }
+        h1 { font-size: 2rem !important; line-height: 1.15 !important; }
+        [data-testid="stMetric"] { padding: 9px; }
+        .team-title { font-size: .95rem; }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -142,6 +156,10 @@ def ensure_state():
         st.session_state.cash_adjustments = {team: 0 for team in st.session_state.teams["Team"]}
     if "trades" not in st.session_state:
         st.session_state.trades = pd.DataFrame(columns=["Trade", "Team A", "Sent A", "Team B", "Sent B", "Cash Detail"])
+    if "is_commissioner" not in st.session_state:
+        st.session_state.is_commissioner = False
+    if "remote_version" not in st.session_state:
+        st.session_state.remote_version = 0
 
 
 def team_summary(picks: pd.DataFrame, teams: pd.DataFrame, cash_adjustments: dict | None = None) -> pd.DataFrame:
@@ -219,39 +237,41 @@ def add_pick(player: str, team: str, price: int, players: pd.DataFrame, summary:
     team_row = summary[summary["Team"] == team].iloc[0]
     if team_row["Open"] <= 0:
         st.error(f"{team} has no open roster spots.")
-        return
+        return False
     if price < 1 or price > team_row["Max Bid"]:
         st.error(f"Valid bid for {team}: $1–${int(team_row['Max Bid'])}.")
-        return
+        return False
     pos = row["Position"]
     if int(team_row[pos]) >= POSITION_LIMITS[pos]:
         st.error(f"{team} has reached the app's {pos} safety limit ({POSITION_LIMITS[pos]}).")
-        return
+        return False
     new = pd.DataFrame([{"Pick": st.session_state.next_pick, "Player": player, "Position": pos, "Team": team, "Budget Team": team, "Price": int(price)}])
     st.session_state.picks = pd.concat([st.session_state.picks, new], ignore_index=True)
     st.session_state.next_pick += 1
     st.success(f"Added {player} to {team} for ${price}.")
+    return True
 
 
 def add_unlisted_pick(player: str, position: str, team: str, price: int, summary: pd.DataFrame):
     player = player.strip()
     if not player:
         st.error("Enter the player's name.")
-        return
+        return False
     existing = set(st.session_state.picks["Player"].astype(str).str.casefold())
     if player.casefold() in existing:
         st.error(f"{player} has already been drafted.")
-        return
+        return False
     team_row = summary[summary["Team"] == team].iloc[0]
     if team_row["Open"] <= 0 or price < 1 or price > team_row["Max Bid"]:
         st.error(f"Valid bid for {team}: $1–${int(team_row['Max Bid'])}.")
-        return
+        return False
     if int(team_row[position]) >= POSITION_LIMITS[position]:
         st.error(f"{team} has reached the {position} safety limit.")
-        return
+        return False
     new = pd.DataFrame([{"Pick": st.session_state.next_pick, "Player": player, "Position": position, "Team": team, "Budget Team": team, "Price": int(price)}])
     st.session_state.picks = pd.concat([st.session_state.picks, new], ignore_index=True)
     st.session_state.next_pick += 1
+    return True
 
 
 def execute_trade(team_a: str, player_a: str, team_b: str, player_b: str,
@@ -370,12 +390,129 @@ def export_state() -> bytes:
     return json.dumps(payload, indent=2).encode()
 
 
+def live_settings():
+    try:
+        url = st.secrets.get("SUPABASE_URL", "")
+        key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
+        pin = st.secrets.get("COMMISSIONER_PIN", "")
+    except Exception:
+        return "", "", ""
+    return str(url), str(key), str(pin)
+
+
+@st.cache_resource(show_spinner=False)
+def get_supabase(url: str, key: str):
+    if not url or not key or create_client is None:
+        return None
+    return create_client(url, key)
+
+
+def apply_state_payload(payload: dict):
+    if not payload or "teams" not in payload:
+        return
+    st.session_state.teams = pd.DataFrame({"Team": payload["teams"]})
+    st.session_state.picks = pd.DataFrame(payload.get("picks", []))
+    if st.session_state.picks.empty:
+        st.session_state.picks = pd.DataFrame(columns=["Pick", "Player", "Position", "Team", "Budget Team", "Price"])
+    else:
+        if "Budget Team" not in st.session_state.picks.columns:
+            st.session_state.picks["Budget Team"] = st.session_state.picks["Team"]
+        st.session_state.picks = st.session_state.picks[["Pick", "Player", "Position", "Team", "Budget Team", "Price"]]
+    st.session_state.next_pick = int(payload.get("next_pick", len(st.session_state.picks) + 1))
+    st.session_state.cash_adjustments = payload.get("cash_adjustments", {team: 0 for team in payload["teams"]})
+    st.session_state.trades = pd.DataFrame(payload.get("trades", []))
+    if st.session_state.trades.empty:
+        st.session_state.trades = pd.DataFrame(columns=["Trade", "Team A", "Sent A", "Team B", "Sent B", "Cash Detail"])
+    else:
+        st.session_state.trades = st.session_state.trades[["Trade", "Team A", "Sent A", "Team B", "Sent B", "Cash Detail"]]
+
+
+def load_shared_state(client) -> bool:
+    if client is None:
+        return False
+    try:
+        response = client.table("draft_state").select("state,version").eq("id", "main").single().execute()
+        row = response.data or {}
+        payload = row.get("state") or {}
+        st.session_state.remote_version = int(row.get("version", 0))
+        apply_state_payload(payload)
+        return True
+    except Exception as exc:
+        st.sidebar.error(f"Live database could not be loaded: {exc}")
+        return False
+
+
+def save_shared_state(client, event_type: str, details: dict | None = None) -> bool:
+    if client is None:
+        return True
+    if not st.session_state.is_commissioner:
+        st.error("Commissioner login is required to make changes.")
+        return False
+    snapshot = json.loads(export_state().decode("utf-8"))
+    clean_details = json.loads(json.dumps(details or {}, default=str))
+    old_version = int(st.session_state.remote_version)
+    new_version = old_version + 1
+    try:
+        response = (client.table("draft_state")
+                    .update({"state": snapshot, "version": new_version, "updated_by": "Josh"})
+                    .eq("id", "main").eq("version", old_version).execute())
+        if not response.data:
+            st.error("Someone updated the draft first. Refresh and try the action again.")
+            return False
+        st.session_state.remote_version = new_version
+        client.table("draft_activity").insert({
+            "event_type": event_type, "manager": "Josh", "details": clean_details
+        }).execute()
+        return True
+    except Exception as exc:
+        st.error(f"The live draft could not be saved: {exc}")
+        return False
+
+
+def load_activity(client) -> pd.DataFrame:
+    if client is None:
+        return pd.DataFrame()
+    try:
+        response = (client.table("draft_activity").select("created_at,event_type,manager,details")
+                    .order("created_at", desc=True).limit(100).execute())
+        return pd.DataFrame(response.data or [])
+    except Exception:
+        return pd.DataFrame()
+
+
 ensure_state()
+
+supabase_url, supabase_key, commissioner_pin = live_settings()
+supabase_client = get_supabase(supabase_url, supabase_key)
+live_enabled = supabase_client is not None and bool(commissioner_pin)
+if live_enabled:
+    load_shared_state(supabase_client)
+    st_autorefresh(interval=5000, limit=None, key="live_draft_refresh")
+can_edit = (not live_enabled) or st.session_state.is_commissioner
 
 st.title("🏈 Live Auction Draft Analyzer")
 st.caption("12 teams · $200 budget · 17-player rosters · live inflation and positional-demand pricing")
 
 with st.sidebar:
+    if live_enabled:
+        st.header("🔴 Live draft")
+        if st.session_state.is_commissioner:
+            st.success("Commissioner mode: Josh")
+            if st.button("Log out of commissioner mode", use_container_width=True):
+                st.session_state.is_commissioner = False
+                st.rerun()
+        else:
+            st.info("Viewer mode · updates every 5 seconds")
+            entered_pin = st.text_input("Commissioner PIN", type="password")
+            if st.button("Unlock editing", use_container_width=True):
+                if entered_pin and hmac.compare_digest(entered_pin, commissioner_pin):
+                    st.session_state.is_commissioner = True
+                    st.rerun()
+                else:
+                    st.error("Incorrect commissioner PIN.")
+        st.divider()
+    else:
+        st.info("Local mode · add live database settings to enable shared viewing")
     st.header("Draft data")
     default_path = Path(DEFAULT_FILE)
     uploaded = st.file_uploader("Auction-value workbook", type=["xlsx"])
@@ -398,18 +535,12 @@ with st.sidebar:
     st.header("Save / restore")
     st.download_button("Download draft backup", export_state(), "auction_draft_backup.json", "application/json", use_container_width=True)
     backup = st.file_uploader("Restore backup", type=["json"], key="backup")
-    if backup and st.button("Restore draft", use_container_width=True):
+    if backup and st.button("Restore draft", use_container_width=True, disabled=not can_edit):
         try:
             payload = json.loads(backup.getvalue())
-            st.session_state.teams = pd.DataFrame({"Team": payload["teams"]})
-            st.session_state.picks = pd.DataFrame(payload["picks"])
-            if "Budget Team" not in st.session_state.picks.columns:
-                st.session_state.picks["Budget Team"] = st.session_state.picks["Team"]
-            st.session_state.picks = st.session_state.picks[["Pick", "Player", "Position", "Team", "Budget Team", "Price"]]
-            st.session_state.next_pick = int(payload.get("next_pick", len(st.session_state.picks) + 1))
-            st.session_state.cash_adjustments = payload.get("cash_adjustments", {team: 0 for team in payload["teams"]})
-            st.session_state.trades = pd.DataFrame(payload.get("trades", []), columns=["Trade", "Team A", "Sent A", "Team B", "Sent B", "Cash Detail"])
-            st.rerun()
+            apply_state_payload(payload)
+            if save_shared_state(supabase_client, "backup_restored", {"players": len(st.session_state.picks)}):
+                st.rerun()
         except Exception as exc:
             st.error(f"Could not restore backup: {exc}")
 
@@ -427,15 +558,17 @@ with st.sidebar:
     st.divider()
     st.header("🎬 Demo mode")
     st.caption("Fill every team with sample picks for a quick presentation.")
-    if st.button("Load Demo Draft", type="primary", use_container_width=True):
+    if st.button("Load Demo Draft", type="primary", use_container_width=True, disabled=not can_edit):
         st.session_state.picks = generate_demo_draft(players, st.session_state.teams)
         st.session_state.cash_adjustments = {team: 0 for team in st.session_state.teams["Team"]}
         st.session_state.trades = pd.DataFrame(columns=["Trade", "Team A", "Sent A", "Team B", "Sent B", "Cash Detail"])
         st.session_state.next_pick = len(st.session_state.picks) + 1
-        st.rerun()
-    if st.button("Clear Entire Draft", use_container_width=True):
+        if save_shared_state(supabase_client, "demo_loaded", {"players": len(st.session_state.picks)}):
+            st.rerun()
+    if st.button("Clear Entire Draft", use_container_width=True, disabled=not can_edit):
         clear_draft_state()
-        st.rerun()
+        if save_shared_state(supabase_client, "draft_cleared"):
+            st.rerun()
 
 summary = team_summary(st.session_state.picks, st.session_state.teams, st.session_state.cash_adjustments)
 live = live_values(players, st.session_state.picks, summary)
@@ -465,17 +598,19 @@ with draft_tab:
             player_choice = st.selectbox("Player", choices["Player"].tolist() if len(choices) else [])
             suggested = int(live.loc[live["Player"] == player_choice, "Live Value"].iloc[0]) if player_choice else 1
             bid = st.number_input("Winning bid", min_value=1, max_value=max(1, selected_max), value=min(max(1, suggested), max(1, selected_max)), step=1)
-            if st.button("Add drafted player", type="primary", use_container_width=True, disabled=not player_choice or not team_choice):
-                add_pick(player_choice, team_choice, int(bid), players, summary)
-                st.rerun()
+            if st.button("Add drafted player", type="primary", use_container_width=True, disabled=(not player_choice or not team_choice or not can_edit)):
+                if add_pick(player_choice, team_choice, int(bid), players, summary):
+                    if save_shared_state(supabase_client, "player_drafted", {"player": player_choice, "team": team_choice, "price": int(bid)}):
+                        st.rerun()
         else:
             manual_name = st.text_input("Player / unit name", placeholder="Example: Eagles DST")
             manual_pos = st.selectbox("Position", ["DST", "K", "QB", "RB", "WR", "TE"])
             bid = st.number_input("Winning bid", min_value=1, max_value=max(1, selected_max), value=1, step=1, key="manual_bid")
             player_choice = None
-            if st.button("Add unlisted player", type="primary", use_container_width=True, disabled=not team_choice):
-                add_unlisted_pick(manual_name, manual_pos, team_choice, int(bid), summary)
-                st.rerun()
+            if st.button("Add unlisted player", type="primary", use_container_width=True, disabled=(not team_choice or not can_edit)):
+                if add_unlisted_pick(manual_name, manual_pos, team_choice, int(bid), summary):
+                    if save_shared_state(supabase_client, "unlisted_player_drafted", {"player": manual_name, "position": manual_pos, "team": team_choice, "price": int(bid)}):
+                        st.rerun()
     with right:
         st.subheader("Selected player")
         if player_choice:
@@ -532,7 +667,7 @@ with board_tab:
                             f'<span class="player-price">${int(pick["Price"])}</span></div>'
                         )
                         st.markdown(player_html, unsafe_allow_html=True)
-                if st.button("➕ Add player", key=f"board_add_{idx}", use_container_width=True, disabled=tr["Open"] <= 0):
+                if st.button("➕ Add player", key=f"board_add_{idx}", use_container_width=True, disabled=(tr["Open"] <= 0 or not can_edit)):
                     st.session_state.board_team = team
                     st.session_state.board_team_select = team
                     st.rerun()
@@ -564,17 +699,19 @@ with board_tab:
             board_bid = form_mid.number_input("Winning bid", min_value=1, max_value=board_max,
                                               value=min(max(1, board_suggested), board_max), step=1, key="board_bid")
             form_right.metric("Money after pick", f"${board_team_row['Left'] - board_bid:.0f}")
-            if st.button(f"Add {board_player} to {board_team}", type="primary", use_container_width=True, disabled=not board_player):
-                add_pick(board_player, board_team, int(board_bid), players, summary)
-                st.rerun()
+            if st.button(f"Add {board_player} to {board_team}", type="primary", use_container_width=True, disabled=(not board_player or not can_edit)):
+                if add_pick(board_player, board_team, int(board_bid), players, summary):
+                    if save_shared_state(supabase_client, "player_drafted", {"player": board_player, "team": board_team, "price": int(board_bid)}):
+                        st.rerun()
         else:
             board_name = form_left.text_input("Player / unit name", placeholder="Example: Eagles DST", key="board_name")
             board_pos = form_mid.selectbox("Position", ["DST", "K", "QB", "RB", "WR", "TE"], key="board_pos")
             board_bid = form_right.number_input("Winning bid", min_value=1, max_value=board_max, value=1, step=1, key="board_manual_bid")
             st.metric("Money after pick", f"${board_team_row['Left'] - board_bid:.0f}")
-            if st.button(f"Add unlisted player to {board_team}", type="primary", use_container_width=True):
-                add_unlisted_pick(board_name, board_pos, board_team, int(board_bid), summary)
-                st.rerun()
+            if st.button(f"Add unlisted player to {board_team}", type="primary", use_container_width=True, disabled=not can_edit):
+                if add_unlisted_pick(board_name, board_pos, board_team, int(board_bid), summary):
+                    if save_shared_state(supabase_client, "unlisted_player_drafted", {"player": board_name, "position": board_pos, "team": board_team, "price": int(board_bid)}):
+                        st.rerun()
         st.info(f"{board_team} currently has ${board_team_row['Left']:.0f} left and needs: {board_team_row['Needs']}")
     else:
         st.success("Every roster is full.")
@@ -617,10 +754,11 @@ with trade_tab:
         preview_a.info(f"**{team_a} receives:** {player_b}" + (f" + ${cash_amount}" if cash_receiver == team_a and cash_amount else "") + f"  \nMoney after trade: **${after_a:.0f}**")
         preview_b.info(f"**{team_b} receives:** {player_a}" + (f" + ${cash_amount}" if cash_receiver == team_b and cash_amount else "") + f"  \nMoney after trade: **${after_b:.0f}**")
 
-        if st.button("Complete trade", type="primary", use_container_width=True):
+        if st.button("Complete trade", type="primary", use_container_width=True, disabled=not can_edit):
             if execute_trade(team_a, player_a, team_b, player_b, cash_payer, int(cash_amount), summary):
-                st.success("Trade completed. Rosters, budgets, max bids, and live values have been updated.")
-                st.rerun()
+                if save_shared_state(supabase_client, "trade_completed", {"team_a": team_a, "sent_a": player_a, "team_b": team_b, "sent_b": player_b, "cash_payer": cash_payer, "cash": int(cash_amount)}):
+                    st.success("Trade completed. Rosters, budgets, max bids, and live values have been updated.")
+                    st.rerun()
 
     if not st.session_state.trades.empty:
         st.divider()
@@ -658,34 +796,50 @@ with log_tab:
                                 disabled=["Pick", "Player", "Position", "Budget Team"], num_rows="fixed",
                                 column_config={"Team": st.column_config.SelectboxColumn(options=st.session_state.teams["Team"].tolist(), required=True), "Price": st.column_config.NumberColumn(min_value=1, step=1, format="$%d")})
         col1, col2 = st.columns(2)
-        if col1.button("Save log edits", use_container_width=True):
+        if col1.button("Save log edits", use_container_width=True, disabled=not can_edit):
             st.session_state.picks = edited.copy()
-            st.rerun()
+            if save_shared_state(supabase_client, "draft_log_edited"):
+                st.rerun()
         undo_options = st.session_state.picks.sort_values("Pick", ascending=False)
         undo_label = col2.selectbox("Remove a pick", [f"#{int(r.Pick)} {r.Player} — {r.Team} ${int(r.Price)}" for _, r in undo_options.iterrows()], label_visibility="collapsed")
-        if col2.button("Remove selected pick", use_container_width=True):
+        if col2.button("Remove selected pick", use_container_width=True, disabled=not can_edit):
             pick_no = int(undo_label.split()[0][1:])
+            removed = st.session_state.picks[st.session_state.picks["Pick"] == pick_no]
             st.session_state.picks = st.session_state.picks[st.session_state.picks["Pick"] != pick_no].reset_index(drop=True)
-            st.rerun()
+            details = removed.iloc[0].to_dict() if not removed.empty else {"pick": pick_no}
+            if save_shared_state(supabase_client, "pick_removed", details):
+                st.rerun()
+    if live_enabled:
+        st.divider()
+        st.subheader("Live activity log")
+        activity = load_activity(supabase_client)
+        if activity.empty:
+            st.caption("No live changes have been recorded yet.")
+        else:
+            activity["created_at"] = pd.to_datetime(activity["created_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            activity["details"] = activity["details"].map(lambda value: json.dumps(value, ensure_ascii=False))
+            st.dataframe(activity, hide_index=True, use_container_width=True)
 
 with settings_tab:
     st.subheader("Team display names")
     name_style = st.radio("Show teams by", ["Team nicknames", "Manager names"], horizontal=True)
     selected_names = DEFAULT_NICKNAMES if name_style == "Team nicknames" else DEFAULT_MANAGERS
-    if st.button(f"Apply {name_style.lower()}", type="primary", use_container_width=True):
+    if st.button(f"Apply {name_style.lower()}", type="primary", use_container_width=True, disabled=not can_edit):
         apply_team_name_set(selected_names)
-        st.rerun()
+        if save_shared_state(supabase_client, "team_name_style_changed", {"style": name_style}):
+            st.rerun()
     name_reference = pd.DataFrame({"Team #": range(1, 13), "Nickname": DEFAULT_NICKNAMES, "Manager": DEFAULT_MANAGERS})
     st.dataframe(name_reference, hide_index=True, use_container_width=True)
     st.divider()
     st.subheader("Or enter custom names")
     edited_teams = st.data_editor(st.session_state.teams, hide_index=True, use_container_width=True, num_rows="fixed")
-    if st.button("Save team names"):
+    if st.button("Save team names", disabled=not can_edit):
         names = edited_teams["Team"].astype(str).str.strip()
         if names.eq("").any() or names.duplicated().any():
             st.error("Every team name must be filled in and unique.")
         else:
             apply_team_name_set(names.tolist())
-            st.rerun()
+            if save_shared_state(supabase_client, "custom_team_names_saved"):
+                st.rerun()
 
 st.caption("Live value = $1 floor + remaining value premium × league inflation × positional demand. Inflation compares flexible dollars remaining with the remaining player-value pool.")
