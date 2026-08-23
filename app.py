@@ -29,6 +29,15 @@ POSITION_COLORS = {
 }
 TEAM_COLORS = ["#2563eb", "#7c3aed", "#db2777", "#dc2626", "#ea580c", "#ca8a04",
                "#16a34a", "#0d9488", "#0891b2", "#4f46e5", "#9333ea", "#475569"]
+DEFAULT_NICKNAMES = [
+    "Wacky Waving Arms", "Team Fluff", "The Ants Marching", "McANUS",
+    "Fu¢ked Again", "Phony Handshakes", "Ricky Kicks", "The Storm",
+    "Blockhead", "Mr. Girth", "Spaces Dogs", "Big Butler Bids",
+]
+DEFAULT_MANAGERS = [
+    "Mark", "Mike T", "Craig", "Frankie", "Ed", "Josh",
+    "Rick", "Bruce", "Ryan", "Dave", "Paul", "Michael",
+]
 
 st.markdown("""
 <style>
@@ -49,6 +58,9 @@ st.markdown("""
     .player-price { color: #0f766e; font-weight: 900; font-size: .86rem; }
     .position-legend { display:flex; flex-wrap:wrap; gap:7px; margin: 8px 0 16px 0; }
     .legend-item { border-radius:999px; padding:5px 10px; font-size:.8rem; font-weight:800; }
+    .roster-counts { display:grid; grid-template-columns:repeat(4,1fr); gap:5px; margin:8px 0 10px 0; }
+    .roster-count { text-align:center; border-radius:8px; padding:5px 2px; font-size:.73rem;
+        font-weight:900; border:1px solid; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -112,7 +124,7 @@ def read_workbook(data: bytes, sheet: str) -> pd.DataFrame:
 
 
 def default_teams() -> pd.DataFrame:
-    return pd.DataFrame({"Team": [f"Team {i}" for i in range(1, TEAM_COUNT + 1)]})
+    return pd.DataFrame({"Team": DEFAULT_NICKNAMES})
 
 
 def ensure_state():
@@ -323,6 +335,32 @@ def clear_draft_state():
     st.session_state.next_pick = 1
 
 
+def apply_team_name_set(new_names: list[str]):
+    old_names = st.session_state.teams["Team"].astype(str).tolist()
+    mapping = dict(zip(old_names, new_names))
+    st.session_state.teams = pd.DataFrame({"Team": new_names})
+    if not st.session_state.picks.empty:
+        st.session_state.picks["Team"] = st.session_state.picks["Team"].map(mapping).fillna(st.session_state.picks["Team"])
+        st.session_state.picks["Budget Team"] = st.session_state.picks["Budget Team"].map(mapping).fillna(st.session_state.picks["Budget Team"])
+    st.session_state.cash_adjustments = {
+        mapping.get(team, team): amount for team, amount in st.session_state.cash_adjustments.items()
+    }
+    if not st.session_state.trades.empty:
+        for col in ["Team A", "Team B"]:
+            st.session_state.trades[col] = st.session_state.trades[col].map(mapping).fillna(st.session_state.trades[col])
+        def rename_cash_detail(detail):
+            detail = str(detail)
+            if detail == "No cash" or " → " not in detail:
+                return detail
+            payer, rest = detail.split(" → ", 1)
+            receiver, amount = rest.rsplit(": ", 1)
+            return f"{mapping.get(payer, payer)} → {mapping.get(receiver, receiver)}: {amount}"
+        st.session_state.trades["Cash Detail"] = st.session_state.trades["Cash Detail"].map(rename_cash_detail)
+    st.session_state.board_team = mapping.get(st.session_state.get("board_team"), new_names[0])
+    if "board_team_select" in st.session_state:
+        st.session_state.board_team_select = mapping.get(st.session_state.board_team_select, new_names[0])
+
+
 def export_state() -> bytes:
     payload = {
         "teams": st.session_state.teams["Team"].tolist(),
@@ -476,6 +514,15 @@ with board_tab:
                 a.metric("Money Left", f"${tr['Left']:.0f}")
                 b.metric("Max Bid", f"${tr['Max Bid']:.0f}")
                 st.caption(f"Spent ${tr['Spent']:.0f} · {int(tr['Open'])} spots open")
+                count_html = '<div class="roster-counts">'
+                for count_pos in ["QB", "RB", "WR", "TE"]:
+                    count_color, count_pale, _ = POSITION_COLORS[count_pos]
+                    count_html += (
+                        f'<span class="roster-count" style="background:{count_pale};color:{count_color};'
+                        f'border-color:{count_color}66">{count_pos} {int(tr[count_pos])}</span>'
+                    )
+                count_html += '</div>'
+                st.markdown(count_html, unsafe_allow_html=True)
                 if tp.empty:
                     st.write("_No players drafted_")
                 else:
@@ -620,19 +667,23 @@ with log_tab:
             st.rerun()
 
 with settings_tab:
-    st.subheader("Rename the 12 teams")
+    st.subheader("Team display names")
+    name_style = st.radio("Show teams by", ["Team nicknames", "Manager names"], horizontal=True)
+    selected_names = DEFAULT_NICKNAMES if name_style == "Team nicknames" else DEFAULT_MANAGERS
+    if st.button(f"Apply {name_style.lower()}", type="primary", use_container_width=True):
+        apply_team_name_set(selected_names)
+        st.rerun()
+    name_reference = pd.DataFrame({"Team #": range(1, 13), "Nickname": DEFAULT_NICKNAMES, "Manager": DEFAULT_MANAGERS})
+    st.dataframe(name_reference, hide_index=True, use_container_width=True)
+    st.divider()
+    st.subheader("Or enter custom names")
     edited_teams = st.data_editor(st.session_state.teams, hide_index=True, use_container_width=True, num_rows="fixed")
     if st.button("Save team names"):
         names = edited_teams["Team"].astype(str).str.strip()
         if names.eq("").any() or names.duplicated().any():
             st.error("Every team name must be filled in and unique.")
         else:
-            mapping = dict(zip(st.session_state.teams["Team"], names))
-            st.session_state.teams = pd.DataFrame({"Team": names})
-            if not st.session_state.picks.empty:
-                st.session_state.picks["Team"] = st.session_state.picks["Team"].map(mapping).fillna(st.session_state.picks["Team"])
-                st.session_state.picks["Budget Team"] = st.session_state.picks["Budget Team"].map(mapping).fillna(st.session_state.picks["Budget Team"])
-            st.session_state.cash_adjustments = {mapping.get(team, team): amount for team, amount in st.session_state.cash_adjustments.items()}
+            apply_team_name_set(names.tolist())
             st.rerun()
 
 st.caption("Live value = $1 floor + remaining value premium × league inflation × positional demand. Inflation compares flexible dollars remaining with the remaining player-value pool.")
