@@ -579,8 +579,8 @@ top2.metric("League Money Left", f"${summary['Left'].sum():,.0f}")
 top3.metric("Live Inflation", f"{live['Market Inflation'].iloc[0]:.2f}×" if len(live) else "—")
 top4.metric("Highest Max Bid", f"${summary['Max Bid'].max():,.0f}")
 
-draft_tab, board_tab, trade_tab, market_tab, teams_tab, log_tab, settings_tab = st.tabs([
-    "Draft Player", "Auction Board", "Trade Center", "Live Player Values", "Team Budgets", "Draft Log", "Team Names"
+draft_tab, board_tab, trade_tab, market_tab, teams_tab, log_tab, roster_tab, settings_tab = st.tabs([
+    "Draft Player", "Auction Board", "Trade Center", "Live Player Values", "Team Budgets", "Draft Log", "Roster Summary", "Team Names"
 ])
 
 with draft_tab:
@@ -819,6 +819,37 @@ with log_tab:
             activity["created_at"] = pd.to_datetime(activity["created_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S UTC")
             activity["details"] = activity["details"].map(lambda value: json.dumps(value, ensure_ascii=False))
             st.dataframe(activity, hide_index=True, use_container_width=True)
+
+with roster_tab:
+    st.subheader("💰 Cash and Position Leaderboard")
+    st.caption("Teams are ranked from the most auction cash remaining to the least.")
+    roster_ranked = summary.sort_values(["Left", "Max Bid", "Team"], ascending=[False, False, True]).reset_index(drop=True)
+    roster_ranked.insert(0, "Rank", range(1, len(roster_ranked) + 1))
+    roster_display = roster_ranked[["Rank", "Team", "Left", "Max Bid", "Players", "Open", "QB", "RB", "WR", "TE", "DST", "K"]].copy()
+    roster_display = roster_display.rename(columns={
+        "Left": "Cash Left", "Max Bid": "Max Bid", "Players": "Total",
+        "QB": "🟥 QB", "RB": "🟩 RB", "WR": "🟦 WR", "TE": "🟧 TE",
+        "DST": "🟪 DST", "K": "🩷 K",
+    })
+    st.dataframe(
+        roster_display,
+        hide_index=True,
+        use_container_width=True,
+        height=485,
+        column_config={
+            "Rank": st.column_config.NumberColumn("Rank", format="#%d", width="small"),
+            "Cash Left": st.column_config.NumberColumn("Cash Left", format="$%.0f"),
+            "Max Bid": st.column_config.NumberColumn("Max Bid", format="$%.0f"),
+            "Total": st.column_config.NumberColumn("Total", format="%d"),
+            "Open": st.column_config.NumberColumn("Open", format="%d"),
+        },
+    )
+    st.download_button(
+        "Download roster summary",
+        roster_display.to_csv(index=False),
+        "auction_roster_summary.csv",
+        "text/csv",
+    )
 
 with settings_tab:
     st.subheader("Team display names")
