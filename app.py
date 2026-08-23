@@ -357,8 +357,6 @@ def apply_team_name_set(new_names: list[str]):
             return f"{mapping.get(payer, payer)} → {mapping.get(receiver, receiver)}: {amount}"
         st.session_state.trades["Cash Detail"] = st.session_state.trades["Cash Detail"].map(rename_cash_detail)
     st.session_state.board_team = mapping.get(st.session_state.get("board_team"), new_names[0])
-    if "board_team_select" in st.session_state:
-        st.session_state.board_team_select = mapping.get(st.session_state.board_team_select, new_names[0])
 
 
 def export_state() -> bytes:
@@ -545,6 +543,10 @@ with board_tab:
     if active_teams:
         if st.session_state.board_team not in active_teams:
             st.session_state.board_team = active_teams[0]
+        # A name-set change happens later in the prior run, after this widget exists.
+        # Clear its stale value here, before recreating the widget on the new run.
+        if "board_team_select" in st.session_state and st.session_state.board_team_select not in active_teams:
+            del st.session_state["board_team_select"]
         board_team = st.selectbox(
             "Add to team",
             active_teams,
