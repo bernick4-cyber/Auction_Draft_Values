@@ -381,6 +381,51 @@ def execute_trade(team_a: str, player_a: str, team_b: str, player_b: str,
     return True
 
 
+
+def update_pick_price(pick_no: int, new_price: int, summary: pd.DataFrame) -> bool:
+    """Change a drafted player's winning bid while preserving the original Budget Team."""
+    matches = st.session_state.picks[st.session_state.picks["Pick"] == pick_no]
+    if matches.empty:
+        st.error("That drafted player could not be found.")
+        return False
+
+    pick = matches.iloc[0]
+    budget_team = pick["Budget Team"] if "Budget Team" in matches.columns else pick["Team"]
+    old_price = int(pick["Price"])
+    budget_row = summary[summary["Team"] == budget_team]
+    if budget_row.empty:
+        st.error(f"Could not find the budget for {budget_team}.")
+        return False
+
+    # Refund the old bid first, then calculate the largest replacement bid that still
+    # preserves $1 for every currently open roster spot on the charged team.
+    current_left = float(budget_row.iloc[0]["Left"])
+    open_spots = int(budget_row.iloc[0]["Open"])
+    max_replacement_bid = max(1, int(current_left + old_price - open_spots))
+
+    if new_price < 1 or new_price > max_replacement_bid:
+        st.error(f"Valid corrected bid: $1–${max_replacement_bid}.")
+        return False
+
+    st.session_state.picks.loc[st.session_state.picks["Pick"] == pick_no, "Price"] = int(new_price)
+    return True
+
+
+def delete_pick(pick_no: int) -> dict | None:
+    """Delete a drafted player. Their original winning bid is automatically refunded."""
+    matches = st.session_state.picks[st.session_state.picks["Pick"] == pick_no]
+    if matches.empty:
+        st.error("That drafted player could not be found.")
+        return None
+
+    removed = matches.iloc[0].to_dict()
+    st.session_state.picks = (
+        st.session_state.picks[st.session_state.picks["Pick"] != pick_no]
+        .reset_index(drop=True)
+    )
+    return removed
+
+
 def generate_demo_draft(players: pd.DataFrame, teams: pd.DataFrame) -> pd.DataFrame:
     """Create a balanced, deterministic seven-player sample roster for every team."""
     team_names = teams["Team"].tolist()
@@ -762,6 +807,78 @@ with board_tab:
                             f'<span class="player-price">${int(pick["Price"])}</span></div>'
                         )
                         st.markdown(player_html, unsafe_allow_html=True)
+
+                    # Commissioner-only correction tools directly on each team's board card.
+                    if can_edit:
+                        with st.expander("✏️ Edit / delete player", expanded=False):
+                            edit_options = tp.sort_values("Pick")
+                            edit_pick_no = st.selectbox(
+                                "Player to edit",
+                                edit_options["Pick"].astype(int).tolist(),
+                                format_func=lambda pno: (
+                                    f"{edit_options.loc[edit_options['Pick'] == pno, 'Player'].iloc[0]} — "
+                                    f"${int(edit_options.loc[edit_options['Pick'] == pno, 'Price'].iloc[0])}"
+                                ),
+                                key=f"board_edit_pick_{idx}",
+                            )
+                            edit_row = edit_options[edit_options["Pick"] == edit_pick_no].iloc[0]
+                            budget_owner = edit_row["Budget Team"] if "Budget Team" in edit_row.index else edit_row["Team"]
+                            budget_owner_row = summary[summary["Team"] == budget_owner].iloc[0]
+                            corrected_max = max(
+                                1,
+                                int(float(budget_owner_row["Left"]) + int(edit_row["Price"]) - int(budget_owner_row["Open"]))
+                            )
+                            corrected_price = st.number_input(
+                                "Winning bid / value",
+                                min_value=1,
+                                max_value=corrected_max,
+                                value=min(int(edit_row["Price"]), corrected_max),
+                                step=1,
+                                key=f"board_edit_price_{idx}_{edit_pick_no}",
+                            )
+                            if budget_owner != team:
+                                st.caption(f"Budget is still charged to {budget_owner} because this player was traded.")
+
+                            edit_col, delete_col = st.columns(2)
+                            if edit_col.button(
+                                "💾 Change value",
+                                key=f"board_save_price_{idx}_{edit_pick_no}",
+                                use_container_width=True,
+                            ):
+                                old_price = int(edit_row["Price"])
+                                if update_pick_price(int(edit_pick_no), int(corrected_price), summary):
+                                    details = {
+                                        "pick": int(edit_pick_no),
+                                        "player": str(edit_row["Player"]),
+                                        "team": str(team),
+                                        "budget_team": str(budget_owner),
+                                        "old_price": old_price,
+                                        "new_price": int(corrected_price),
+                                    }
+                                    if save_shared_state(supabase_client, "winning_bid_changed", details):
+                                        st.success(f"Updated {edit_row['Player']} from ${old_price} to ${int(corrected_price)}.")
+                                        st.rerun()
+
+                            if delete_col.button(
+                                "🗑️ Delete player",
+                                key=f"board_delete_pick_{idx}_{edit_pick_no}",
+                                use_container_width=True,
+                            ):
+                                removed = delete_pick(int(edit_pick_no))
+                                if removed is not None:
+                                    details = {
+                                        "pick": int(removed.get("Pick", edit_pick_no)),
+                                        "player": str(removed.get("Player", "")),
+                                        "team": str(removed.get("Team", team)),
+                                        "budget_team": str(removed.get("Budget Team", removed.get("Team", team))),
+                                        "refunded_price": int(removed.get("Price", 0)),
+                                    }
+                                    if save_shared_state(supabase_client, "player_deleted", details):
+                                        st.success(
+                                            f"Deleted {details['player']} and refunded ${details['refunded_price']} "
+                                            f"to {details['budget_team']}."
+                                        )
+                                        st.rerun()
                 if st.button("➕ Add player", key=f"board_add_{idx}", use_container_width=True, disabled=(tr["Open"] <= 0 or not can_edit)):
                     st.session_state.board_team = team
                     st.session_state.board_team_select = team
