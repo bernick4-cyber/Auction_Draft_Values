@@ -24,7 +24,7 @@ ROSTER_SIZE = 17
 STARTER_LIMITS = {"QB": 1, "RB": 1, "WR": 2, "TE": 1, "FLEX": 2, "DST": 1, "K": 1}
 POSITION_LIMITS = {"QB": 4, "RB": 9, "WR": 10, "TE": 5, "DST": 3, "K": 3}
 ELIGIBLE_FLEX = {"RB", "WR", "TE"}
-DEFAULT_FILE = "2026_Auction_Value_vs_Rank.xlsx"
+DEFAULT_FILE = "2026_Auction_Value_vs_Rank_VALUE_LOGIC_UPDATED.xlsx"
 POSITION_COLORS = {
     "QB": ("#ef4444", "#fee2e2", "🟥"),
     "RB": ("#22c55e", "#dcfce7", "🟩"),
@@ -111,22 +111,70 @@ def clean_players(raw: pd.DataFrame) -> pd.DataFrame:
     })
     mappings = {
         "POS Rank": find("pos rank", "position rank"),
-        "Overall Rank": find("overall rank", "rank"),
+        "Overall Rank": find("overall rank", "rank", "dk draft rank"),
         "Auction $": find("auction $", "auction value", "value", "price"),
-        "Regression Price": find("regression price", "projected price"),
+        "Auction Rank": find("auction rank"),
+        "Regression Price": find("regression price", "projected price", "expected $ at dk rank", "expected $ at pick"),
         "Value Label": find("value label", "verdict"),
+        "Auction $ Edge": find("auction $ edge"),
+        "Auction Rank Edge": find("auction rank edge"),
+        "Value Score": find("value score"),
     }
     for target, source in mappings.items():
         out[target] = raw[source] if source else np.nan
 
     out = out[(out["Player"] != "") & (out["Player"].str.lower() != "nan")]
     out = out[out["Position"].isin(["QB", "RB", "WR", "TE", "DST", "K"])]
-    for col in ["Overall Rank", "Auction $", "Regression Price"]:
+    for col in [
+        "Overall Rank", "Auction $", "Auction Rank", "Regression Price",
+        "Auction $ Edge", "Auction Rank Edge", "Value Score"
+    ]:
         out[col] = pd.to_numeric(out[col], errors="coerce")
+
     out["Overall Rank"] = out["Overall Rank"].fillna(9999).astype(int)
-    out["Base Value"] = out["Auction $"].fillna(0).clip(lower=0)
-    # Every draftable player has a $1 floor in a standard auction.
-    out["Base Value"] = out["Base Value"].where(out["Base Value"] > 0, 1.0)
+
+    # Keep the workbook's true auction value separate from the $1 live-auction floor.
+    out["Auction $"] = out["Auction $"].fillna(0).clip(lower=0)
+
+    # Recalculate the draft-value logic in Python so the app does not depend on Excel formulas.
+    calculated_expected = (42.71 - 0.42 * out["Overall Rank"]).clip(lower=0)
+    out["Regression Price"] = out["Regression Price"].fillna(calculated_expected)
+
+    if "Auction Rank" not in out.columns:
+        out["Auction Rank"] = np.nan
+    out["Auction Rank"] = pd.to_numeric(out["Auction Rank"], errors="coerce")
+
+    out["Auction $ Edge"] = out["Auction $ Edge"].fillna(out["Auction $"] - out["Regression Price"])
+    out["Auction Rank Edge"] = out["Auction Rank Edge"].fillna(out["Overall Rank"] - out["Auction Rank"])
+    out["Value Score"] = out["Value Score"].fillna(
+        out["Auction $ Edge"] + 0.20 * out["Auction Rank Edge"].fillna(0)
+    )
+
+    def classify_value(row):
+        if float(row["Auction $"]) <= 0:
+            return "No Auction Value"
+        dollar_edge = float(row["Auction $ Edge"]) if pd.notna(row["Auction $ Edge"]) else 0.0
+        rank_edge = float(row["Auction Rank Edge"]) if pd.notna(row["Auction Rank Edge"]) else 0.0
+        if dollar_edge >= 8 or rank_edge >= 15:
+            return "🔥 STEAL"
+        if dollar_edge >= 4 or rank_edge >= 7:
+            return "✅ VALUE"
+        if dollar_edge >= 1.5 or rank_edge >= 3:
+            return "👍 SLIGHT VALUE"
+        if -1.5 < dollar_edge < 1.5 and -3 < rank_edge < 3:
+            return "FAIR"
+        if dollar_edge <= -5 or rank_edge <= -10:
+            return "❌ AVOID"
+        return "⚠️ REACH"
+
+    calculated_labels = out.apply(classify_value, axis=1)
+    out["Value Label"] = out["Value Label"].where(
+        out["Value Label"].notna() & (out["Value Label"].astype(str).str.strip() != ""),
+        calculated_labels
+    )
+
+    # Every draftable player still has a $1 floor for live auction inflation calculations.
+    out["Base Value"] = out["Auction $"].where(out["Auction $"] > 0, 1.0)
     out["Player Key"] = out["Player"].str.casefold()
     out = out.drop_duplicates("Player Key", keep="first").sort_values("Overall Rank")
     return out.reset_index(drop=True)
@@ -230,6 +278,25 @@ def live_values(players: pd.DataFrame, picks: pd.DataFrame, summary: pd.DataFram
         ["Rising", "Falling"], default="Stable"
     )
     return avail.sort_values(["Live Value", "Overall Rank"], ascending=[False, True])
+
+
+
+def best_values(players: pd.DataFrame, picks: pd.DataFrame) -> pd.DataFrame:
+    """Return undrafted players who grade as positive draft values."""
+    drafted = set(picks["Player"].astype(str).str.casefold())
+    avail = players[~players["Player Key"].isin(drafted)].copy()
+
+    # Only players with a real positive auction value can be a Best Value target.
+    avail = avail[avail["Auction $"] > 0].copy()
+    avail = avail[avail["Value Label"].isin(["🔥 STEAL", "✅ VALUE", "👍 SLIGHT VALUE"])].copy()
+
+    # Higher combined score is better. Rank edge breaks ties in favor of players
+    # the auction board prefers much earlier than DraftKings ADP.
+    avail = avail.sort_values(
+        ["Value Score", "Auction $ Edge", "Auction Rank Edge", "Overall Rank"],
+        ascending=[False, False, False, True]
+    )
+    return avail.reset_index(drop=True)
 
 
 def add_pick(player: str, team: str, price: int, players: pd.DataFrame, summary: pd.DataFrame):
@@ -579,8 +646,9 @@ top2.metric("League Money Left", f"${summary['Left'].sum():,.0f}")
 top3.metric("Live Inflation", f"{live['Market Inflation'].iloc[0]:.2f}×" if len(live) else "—")
 top4.metric("Highest Max Bid", f"${summary['Max Bid'].max():,.0f}")
 
-draft_tab, board_tab, trade_tab, market_tab, teams_tab, log_tab, roster_tab, settings_tab = st.tabs([
-    "Draft Player", "Auction Board", "Trade Center", "Live Player Values", "Team Budgets", "Draft Log", "Roster Summary", "Team Names"
+draft_tab, board_tab, trade_tab, market_tab, best_tab, teams_tab, log_tab, roster_tab, settings_tab = st.tabs([
+    "Draft Player", "Auction Board", "Trade Center", "Live Player Values", "Best Values",
+    "Team Budgets", "Draft Log", "Roster Summary", "Team Names"
 ])
 
 with draft_tab:
@@ -616,11 +684,22 @@ with draft_tab:
         if player_choice:
             pr = live[live["Player"] == player_choice].iloc[0]
             a, b, c, d = st.columns(4)
-            a.metric("Original Value", f"${pr['Base Value']:.0f}")
+            a.metric("Auction Value", f"${pr['Auction $']:.0f}")
             b.metric("Live Value", f"${pr['Live Value']:.0f}", f"{pr['Change']:+.0f}")
-            c.metric("Position", pr["Position"])
-            d.metric("Overall Rank", int(pr["Overall Rank"]))
-            st.write(f"Market: **{pr['Market']}** · Position-demand factor: **{pr['Position Demand']:.2f}×**")
+            c.metric("DK Draft Rank", int(pr["Overall Rank"]))
+            d.metric("Value Grade", str(pr["Value Label"]))
+
+            e, f, g = st.columns(3)
+            expected_text = f"${pr['Regression Price']:.2f}" if pd.notna(pr["Regression Price"]) else "—"
+            dollar_edge_text = f"${pr['Auction $ Edge']:+.2f}" if pd.notna(pr["Auction $ Edge"]) else "—"
+            rank_edge_text = f"{pr['Auction Rank Edge']:+.0f} picks" if pd.notna(pr["Auction Rank Edge"]) else "—"
+            e.metric("Expected $ at Pick", expected_text)
+            f.metric("Auction $ Edge", dollar_edge_text)
+            g.metric("Auction Rank Edge", rank_edge_text)
+            st.write(
+                f"Market: **{pr['Market']}** · Position-demand factor: **{pr['Position Demand']:.2f}×** "
+                f"· Value score: **{pr['Value Score']:.2f}**"
+            )
         if team_choice:
             tr = summary[summary["Team"] == team_choice].iloc[0]
             st.info(f"{team_choice}: ${tr['Left']:.0f} left · {int(tr['Open'])} spots open · maximum bid ${tr['Max Bid']:.0f} · needs {tr['Needs']}")
@@ -773,14 +852,96 @@ with market_tab:
     min_value = c2.number_input("Minimum live value", min_value=1, value=1)
     market_filter = c3.multiselect("Movement", ["Rising", "Stable", "Falling"], default=["Rising", "Stable", "Falling"])
     shown = live[live["Position"].isin(pos_filter) & (live["Live Value"] >= min_value) & live["Market"].isin(market_filter)]
-    cols = ["Player", "Position", "POS Rank", "Overall Rank", "Base Value", "Live Value", "Change", "Market", "Position Demand"]
+    cols = [
+        "Player", "Position", "POS Rank", "Overall Rank", "Auction $", "Auction Rank",
+        "Regression Price", "Auction $ Edge", "Auction Rank Edge", "Value Score", "Value Label",
+        "Live Value", "Change", "Market", "Position Demand"
+    ]
     colorful_shown = shown[cols].copy()
     colorful_shown["Position"] = colorful_shown["Position"].map(
         lambda p: f"{POSITION_COLORS.get(p, ('', '', '⬜'))[2]} {p}"
     )
     st.dataframe(colorful_shown, hide_index=True, use_container_width=True, height=650,
-                 column_config={"Base Value": st.column_config.NumberColumn(format="$%.0f"), "Live Value": st.column_config.NumberColumn(format="$%d"), "Change": st.column_config.NumberColumn(format="%+d"), "Position Demand": st.column_config.NumberColumn(format="%.2fx")})
+                 column_config={
+                     "Auction $": st.column_config.NumberColumn(format="$%.0f"),
+                     "Regression Price": st.column_config.NumberColumn(format="$%.2f"),
+                     "Auction $ Edge": st.column_config.NumberColumn(format="$%+.2f"),
+                     "Auction Rank Edge": st.column_config.NumberColumn(format="%+d"),
+                     "Value Score": st.column_config.NumberColumn(format="%.2f"),
+                     "Live Value": st.column_config.NumberColumn(format="$%d"),
+                     "Change": st.column_config.NumberColumn(format="%+d"),
+                     "Position Demand": st.column_config.NumberColumn(format="%.2fx")
+                 })
     st.download_button("Download current live values", shown[cols].to_csv(index=False), "live_auction_values.csv", "text/csv")
+
+
+with best_tab:
+    st.subheader("🔥 Best Values")
+    st.caption(
+        "Undrafted players whose auction value/rank is stronger than their DraftKings draft position. "
+        "Value Score = Auction $ Edge + 20% of Auction Rank Edge."
+    )
+    st.markdown(position_legend(), unsafe_allow_html=True)
+
+    value_pool = best_values(players, st.session_state.picks)
+
+    if value_pool.empty:
+        st.info("No positive auction-value targets are currently available.")
+    else:
+        v1, v2, v3 = st.columns(3)
+        value_positions = v1.multiselect(
+            "Position",
+            ["QB", "RB", "WR", "TE", "DST", "K"],
+            default=["QB", "RB", "WR", "TE"],
+            key="best_value_positions",
+        )
+        labels = v2.multiselect(
+            "Value tier",
+            ["🔥 STEAL", "✅ VALUE", "👍 SLIGHT VALUE"],
+            default=["🔥 STEAL", "✅ VALUE", "👍 SLIGHT VALUE"],
+            key="best_value_labels",
+        )
+        max_rows = v3.slider("Show top", 10, 100, 30, 5, key="best_value_rows")
+
+        shown_values = value_pool[
+            value_pool["Position"].isin(value_positions)
+            & value_pool["Value Label"].isin(labels)
+        ].head(max_rows).copy()
+
+        display_cols = [
+            "Player", "Position", "POS Rank", "Overall Rank", "Auction $", "Auction Rank",
+            "Regression Price", "Auction $ Edge", "Auction Rank Edge", "Value Score", "Value Label"
+        ]
+        for col in display_cols:
+            if col not in shown_values.columns:
+                shown_values[col] = np.nan
+
+        shown_values = shown_values[display_cols].rename(columns={
+            "Overall Rank": "DK Draft Rank",
+            "Regression Price": "Expected $ at Pick",
+            "Value Label": "Verdict",
+        })
+
+        st.dataframe(
+            shown_values,
+            hide_index=True,
+            use_container_width=True,
+            height=650,
+            column_config={
+                "Auction $": st.column_config.NumberColumn(format="$%.0f"),
+                "Expected $ at Pick": st.column_config.NumberColumn(format="$%.2f"),
+                "Auction $ Edge": st.column_config.NumberColumn(format="$%+.2f"),
+                "Auction Rank Edge": st.column_config.NumberColumn(format="%+d"),
+                "Value Score": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+        st.download_button(
+            "Download Best Values",
+            shown_values.to_csv(index=False),
+            "best_values.csv",
+            "text/csv",
+            use_container_width=True,
+        )
 
 with teams_tab:
     st.subheader("Money, roster space, and needs")
