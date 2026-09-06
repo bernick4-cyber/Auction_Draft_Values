@@ -640,16 +640,32 @@ with st.sidebar:
 summary = team_summary(st.session_state.picks, st.session_state.teams, st.session_state.cash_adjustments)
 live = live_values(players, st.session_state.picks, summary)
 
-top1, top2, top3, top4 = st.columns(4)
-top1.metric("Players Drafted", len(st.session_state.picks), f"of {TEAM_COUNT * ROSTER_SIZE}")
-top2.metric("League Money Left", f"${summary['Left'].sum():,.0f}")
-top3.metric("Live Inflation", f"{live['Market Inflation'].iloc[0]:.2f}×" if len(live) else "—")
-top4.metric("Highest Max Bid", f"${summary['Max Bid'].max():,.0f}")
+# Commissioner-only analytics. In local mode these remain visible so the app can still be tested.
+show_private_values = (not live_enabled) or st.session_state.is_commissioner
 
-draft_tab, board_tab, trade_tab, market_tab, best_tab, teams_tab, log_tab, roster_tab, settings_tab = st.tabs([
-    "Draft Player", "Auction Board", "Trade Center", "Live Player Values", "Best Values",
-    "Team Budgets", "Draft Log", "Roster Summary", "Team Names"
-])
+if show_private_values:
+    top1, top2, top3, top4 = st.columns(4)
+    top1.metric("Players Drafted", len(st.session_state.picks), f"of {TEAM_COUNT * ROSTER_SIZE}")
+    top2.metric("League Money Left", f"${summary['Left'].sum():,.0f}")
+    top3.metric("Live Inflation", f"{live['Market Inflation'].iloc[0]:.2f}×" if len(live) else "—")
+    top4.metric("Highest Max Bid", f"${summary['Max Bid'].max():,.0f}")
+
+    draft_tab, board_tab, trade_tab, market_tab, best_tab, teams_tab, log_tab, roster_tab, settings_tab = st.tabs([
+        "Draft Player", "Auction Board", "Trade Center", "Live Player Values", "Best Values",
+        "Team Budgets", "Draft Log", "Roster Summary", "Team Names"
+    ])
+else:
+    top1, top2, top3 = st.columns(3)
+    top1.metric("Players Drafted", len(st.session_state.picks), f"of {TEAM_COUNT * ROSTER_SIZE}")
+    top2.metric("League Money Left", f"${summary['Left'].sum():,.0f}")
+    top3.metric("Highest Max Bid", f"${summary['Max Bid'].max():,.0f}")
+
+    draft_tab, board_tab, trade_tab, teams_tab, log_tab, roster_tab, settings_tab = st.tabs([
+        "Draft Player", "Auction Board", "Trade Center",
+        "Team Budgets", "Draft Log", "Roster Summary", "Team Names"
+    ])
+    market_tab = None
+    best_tab = None
 
 with draft_tab:
     left, right = st.columns([1, 1.25])
@@ -844,105 +860,105 @@ with trade_tab:
         st.markdown("### Trade history")
         st.dataframe(st.session_state.trades, hide_index=True, use_container_width=True)
 
-with market_tab:
-    st.subheader("Recalculated available-player values")
-    st.markdown(position_legend(), unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    pos_filter = c1.multiselect("Position", ["QB", "RB", "WR", "TE", "DST", "K"], default=["QB", "RB", "WR", "TE"])
-    min_value = c2.number_input("Minimum live value", min_value=1, value=1)
-    market_filter = c3.multiselect("Movement", ["Rising", "Stable", "Falling"], default=["Rising", "Stable", "Falling"])
-    shown = live[live["Position"].isin(pos_filter) & (live["Live Value"] >= min_value) & live["Market"].isin(market_filter)]
-    cols = [
-        "Player", "Position", "POS Rank", "Overall Rank", "Auction $", "Auction Rank",
-        "Regression Price", "Auction $ Edge", "Auction Rank Edge", "Value Score", "Value Label",
-        "Live Value", "Change", "Market", "Position Demand"
-    ]
-    colorful_shown = shown[cols].copy()
-    colorful_shown["Position"] = colorful_shown["Position"].map(
-        lambda p: f"{POSITION_COLORS.get(p, ('', '', '⬜'))[2]} {p}"
-    )
-    st.dataframe(colorful_shown, hide_index=True, use_container_width=True, height=650,
-                 column_config={
-                     "Auction $": st.column_config.NumberColumn(format="$%.0f"),
-                     "Regression Price": st.column_config.NumberColumn(format="$%.2f"),
-                     "Auction $ Edge": st.column_config.NumberColumn(format="$%+.2f"),
-                     "Auction Rank Edge": st.column_config.NumberColumn(format="%+d"),
-                     "Value Score": st.column_config.NumberColumn(format="%.2f"),
-                     "Live Value": st.column_config.NumberColumn(format="$%d"),
-                     "Change": st.column_config.NumberColumn(format="%+d"),
-                     "Position Demand": st.column_config.NumberColumn(format="%.2fx")
-                 })
-    st.download_button("Download current live values", shown[cols].to_csv(index=False), "live_auction_values.csv", "text/csv")
-
-
-with best_tab:
-    st.subheader("🔥 Best Values")
-    st.caption(
-        "Undrafted players whose auction value/rank is stronger than their DraftKings draft position. "
-        "Value Score = Auction $ Edge + 20% of Auction Rank Edge."
-    )
-    st.markdown(position_legend(), unsafe_allow_html=True)
-
-    value_pool = best_values(players, st.session_state.picks)
-
-    if value_pool.empty:
-        st.info("No positive auction-value targets are currently available.")
-    else:
-        v1, v2, v3 = st.columns(3)
-        value_positions = v1.multiselect(
-            "Position",
-            ["QB", "RB", "WR", "TE", "DST", "K"],
-            default=["QB", "RB", "WR", "TE"],
-            key="best_value_positions",
-        )
-        labels = v2.multiselect(
-            "Value tier",
-            ["🔥 STEAL", "✅ VALUE", "👍 SLIGHT VALUE"],
-            default=["🔥 STEAL", "✅ VALUE", "👍 SLIGHT VALUE"],
-            key="best_value_labels",
-        )
-        max_rows = v3.slider("Show top", 10, 100, 30, 5, key="best_value_rows")
-
-        shown_values = value_pool[
-            value_pool["Position"].isin(value_positions)
-            & value_pool["Value Label"].isin(labels)
-        ].head(max_rows).copy()
-
-        display_cols = [
+if show_private_values:
+    with market_tab:
+        st.subheader("Recalculated available-player values")
+        st.markdown(position_legend(), unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        pos_filter = c1.multiselect("Position", ["QB", "RB", "WR", "TE", "DST", "K"], default=["QB", "RB", "WR", "TE"])
+        min_value = c2.number_input("Minimum live value", min_value=1, value=1)
+        market_filter = c3.multiselect("Movement", ["Rising", "Stable", "Falling"], default=["Rising", "Stable", "Falling"])
+        shown = live[live["Position"].isin(pos_filter) & (live["Live Value"] >= min_value) & live["Market"].isin(market_filter)]
+        cols = [
             "Player", "Position", "POS Rank", "Overall Rank", "Auction $", "Auction Rank",
-            "Regression Price", "Auction $ Edge", "Auction Rank Edge", "Value Score", "Value Label"
+            "Regression Price", "Auction $ Edge", "Auction Rank Edge", "Value Score", "Value Label",
+            "Live Value", "Change", "Market", "Position Demand"
         ]
-        for col in display_cols:
-            if col not in shown_values.columns:
-                shown_values[col] = np.nan
-
-        shown_values = shown_values[display_cols].rename(columns={
-            "Overall Rank": "DK Draft Rank",
-            "Regression Price": "Expected $ at Pick",
-            "Value Label": "Verdict",
-        })
-
-        st.dataframe(
-            shown_values,
-            hide_index=True,
-            use_container_width=True,
-            height=650,
-            column_config={
-                "Auction $": st.column_config.NumberColumn(format="$%.0f"),
-                "Expected $ at Pick": st.column_config.NumberColumn(format="$%.2f"),
-                "Auction $ Edge": st.column_config.NumberColumn(format="$%+.2f"),
-                "Auction Rank Edge": st.column_config.NumberColumn(format="%+d"),
-                "Value Score": st.column_config.NumberColumn(format="%.2f"),
-            },
+        colorful_shown = shown[cols].copy()
+        colorful_shown["Position"] = colorful_shown["Position"].map(
+            lambda p: f"{POSITION_COLORS.get(p, ('', '', '⬜'))[2]} {p}"
         )
-        st.download_button(
-            "Download Best Values",
-            shown_values.to_csv(index=False),
-            "best_values.csv",
-            "text/csv",
-            use_container_width=True,
+        st.dataframe(colorful_shown, hide_index=True, use_container_width=True, height=650,
+                     column_config={
+                         "Auction $": st.column_config.NumberColumn(format="$%.0f"),
+                         "Regression Price": st.column_config.NumberColumn(format="$%.2f"),
+                         "Auction $ Edge": st.column_config.NumberColumn(format="$%+.2f"),
+                         "Auction Rank Edge": st.column_config.NumberColumn(format="%+d"),
+                         "Value Score": st.column_config.NumberColumn(format="%.2f"),
+                         "Live Value": st.column_config.NumberColumn(format="$%d"),
+                         "Change": st.column_config.NumberColumn(format="%+d"),
+                         "Position Demand": st.column_config.NumberColumn(format="%.2fx")
+                     })
+        st.download_button("Download current live values", shown[cols].to_csv(index=False), "live_auction_values.csv", "text/csv")
+    
+if show_private_values:
+    with best_tab:
+        st.subheader("🔥 Best Values")
+        st.caption(
+            "Undrafted players whose auction value/rank is stronger than their DraftKings draft position. "
+            "Value Score = Auction $ Edge + 20% of Auction Rank Edge."
         )
-
+        st.markdown(position_legend(), unsafe_allow_html=True)
+    
+        value_pool = best_values(players, st.session_state.picks)
+    
+        if value_pool.empty:
+            st.info("No positive auction-value targets are currently available.")
+        else:
+            v1, v2, v3 = st.columns(3)
+            value_positions = v1.multiselect(
+                "Position",
+                ["QB", "RB", "WR", "TE", "DST", "K"],
+                default=["QB", "RB", "WR", "TE"],
+                key="best_value_positions",
+            )
+            labels = v2.multiselect(
+                "Value tier",
+                ["🔥 STEAL", "✅ VALUE", "👍 SLIGHT VALUE"],
+                default=["🔥 STEAL", "✅ VALUE", "👍 SLIGHT VALUE"],
+                key="best_value_labels",
+            )
+            max_rows = v3.slider("Show top", 10, 100, 30, 5, key="best_value_rows")
+    
+            shown_values = value_pool[
+                value_pool["Position"].isin(value_positions)
+                & value_pool["Value Label"].isin(labels)
+            ].head(max_rows).copy()
+    
+            display_cols = [
+                "Player", "Position", "POS Rank", "Overall Rank", "Auction $", "Auction Rank",
+                "Regression Price", "Auction $ Edge", "Auction Rank Edge", "Value Score", "Value Label"
+            ]
+            for col in display_cols:
+                if col not in shown_values.columns:
+                    shown_values[col] = np.nan
+    
+            shown_values = shown_values[display_cols].rename(columns={
+                "Overall Rank": "DK Draft Rank",
+                "Regression Price": "Expected $ at Pick",
+                "Value Label": "Verdict",
+            })
+    
+            st.dataframe(
+                shown_values,
+                hide_index=True,
+                use_container_width=True,
+                height=650,
+                column_config={
+                    "Auction $": st.column_config.NumberColumn(format="$%.0f"),
+                    "Expected $ at Pick": st.column_config.NumberColumn(format="$%.2f"),
+                    "Auction $ Edge": st.column_config.NumberColumn(format="$%+.2f"),
+                    "Auction Rank Edge": st.column_config.NumberColumn(format="%+d"),
+                    "Value Score": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+            st.download_button(
+                "Download Best Values",
+                shown_values.to_csv(index=False),
+                "best_values.csv",
+                "text/csv",
+                use_container_width=True,
+            )
 with teams_tab:
     st.subheader("Money, roster space, and needs")
     st.dataframe(summary, hide_index=True, use_container_width=True,
