@@ -879,10 +879,88 @@ with board_tab:
                                             f"to {details['budget_team']}."
                                         )
                                         st.rerun()
-                if st.button("➕ Add player", key=f"board_add_{idx}", use_container_width=True, disabled=(tr["Open"] <= 0 or not can_edit)):
-                    st.session_state.board_team = team
-                    st.session_state.board_team_select = team
-                    st.rerun()
+                # Commissioner-only inline add-and-save controls on each team card.
+                if can_edit and tr["Open"] > 0:
+                    with st.expander("➕ Add player", expanded=False):
+                        inline_manual = st.checkbox(
+                            "Player is not in workbook",
+                            key=f"board_inline_manual_{idx}",
+                        )
+
+                        inline_max = max(1, int(tr["Max Bid"]))
+
+                        if not inline_manual:
+                            inline_player = st.selectbox(
+                                "Player",
+                                live["Player"].tolist(),
+                                key=f"board_inline_player_{idx}",
+                            )
+                            inline_suggested = (
+                                int(live.loc[live["Player"] == inline_player, "Live Value"].iloc[0])
+                                if inline_player else 1
+                            )
+                            inline_bid = st.number_input(
+                                "Winning bid",
+                                min_value=1,
+                                max_value=inline_max,
+                                value=min(max(1, inline_suggested), inline_max),
+                                step=1,
+                                key=f"board_inline_bid_{idx}",
+                            )
+                            st.caption(f"Money after pick: ${float(tr['Left']) - int(inline_bid):.0f}")
+
+                            if st.button(
+                                f"💾 Add & save to {team}",
+                                key=f"board_inline_save_{idx}",
+                                use_container_width=True,
+                                type="primary",
+                                disabled=not inline_player,
+                            ):
+                                if add_pick(inline_player, team, int(inline_bid), players, summary):
+                                    details = {
+                                        "player": inline_player,
+                                        "team": team,
+                                        "price": int(inline_bid),
+                                    }
+                                    if save_shared_state(supabase_client, "player_drafted", details):
+                                        st.rerun()
+                        else:
+                            inline_name = st.text_input(
+                                "Player / unit name",
+                                placeholder="Example: Eagles DST",
+                                key=f"board_inline_name_{idx}",
+                            )
+                            inline_pos = st.selectbox(
+                                "Position",
+                                ["DST", "K", "QB", "RB", "WR", "TE"],
+                                key=f"board_inline_pos_{idx}",
+                            )
+                            inline_bid = st.number_input(
+                                "Winning bid",
+                                min_value=1,
+                                max_value=inline_max,
+                                value=1,
+                                step=1,
+                                key=f"board_inline_manual_bid_{idx}",
+                            )
+                            st.caption(f"Money after pick: ${float(tr['Left']) - int(inline_bid):.0f}")
+
+                            if st.button(
+                                f"💾 Add & save to {team}",
+                                key=f"board_inline_manual_save_{idx}",
+                                use_container_width=True,
+                                type="primary",
+                                disabled=not inline_name.strip(),
+                            ):
+                                if add_unlisted_pick(inline_name, inline_pos, team, int(inline_bid), summary):
+                                    details = {
+                                        "player": inline_name.strip(),
+                                        "position": inline_pos,
+                                        "team": team,
+                                        "price": int(inline_bid),
+                                    }
+                                    if save_shared_state(supabase_client, "unlisted_player_drafted", details):
+                                        st.rerun()
         st.divider()
 
     st.markdown("### Add a player from the board")
