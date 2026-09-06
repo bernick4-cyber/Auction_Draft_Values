@@ -24,7 +24,7 @@ ROSTER_SIZE = 17
 STARTER_LIMITS = {"QB": 1, "RB": 1, "WR": 2, "TE": 1, "FLEX": 2, "DST": 1, "K": 1}
 POSITION_LIMITS = {"QB": 4, "RB": 9, "WR": 10, "TE": 5, "DST": 3, "K": 3}
 ELIGIBLE_FLEX = {"RB", "WR", "TE"}
-DEFAULT_FILE = "2026_Auction_Value_vs_Rank_VALUE_LOGIC_UPDATED.xlsx"
+DEFAULT_FILE = "2026 Auction value vs rank.xlsx"
 POSITION_COLORS = {
     "QB": ("#ef4444", "#fee2e2", "🟥"),
     "RB": ("#22c55e", "#dcfce7", "🟩"),
